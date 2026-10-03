@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, is_dataclass, asdict
 from datetime import datetime, timezone
 from decimal import Decimal
+from threading import RLock
 from typing import Any, Callable, Mapping, TypeVar
 
 from railforge.audit.trail import Trail
@@ -21,7 +22,12 @@ from railforge.locomotive.tractive_effort import available_effort
 from railforge.maintenance.release import releasable
 from railforge.possession.windows import conflicts as possession_conflicts
 from railforge.routing.clearance import route_ok
-from railforge.signaling.block_occupancy import reserve
+from railforge.signaling.block_occupancy import (
+    Occupancy,
+    conflicts as block_conflicts,
+    from_record,
+    normalized,
+)
 from railforge.storage.ops_store import VersionedStore
 from railforge.timetable.meets import conflicts as meet_conflicts
 from railforge.wagon.axle_load import route_ok as axle_route_ok
@@ -30,7 +36,8 @@ from railforge.yard.switching import lock_route
 from railforge.crew.duty import legal as duty_legal
 
 T = TypeVar("T")
-BROKEN_CONTROL_TOPICS: set[str] = set()
+
+BLOCK_TOPIC = "dispatch.block.reserved"
 
 
 def _safe(value: Any) -> Any:
@@ -68,41 +75,117 @@ class RailForgeWorkflowControl:
         self.store = store or VersionedStore()
         self._receipts: dict[str, OperationReceipt] = {}
         self._consumers: dict[str, CursorConsumer] = {}
+        # Serializes decision -> state -> stream -> audit so a concurrent
+        # committer cannot interleave between the occupancy check and the
+        # state write. Reentrant because some workflows nest sub-commits.
+        self._plane_lock = RLock()
 
     @property
     def receipts(self) -> Mapping[str, OperationReceipt]:
         return dict(self._receipts)
 
+    @staticmethod
+    def _block_key(block: str) -> str:
+        return f"dispatch.block:{block}"
+
+    def _block_board(self, block: str) -> tuple[list[Occupancy], int]:
+        row = self.store.read(self._block_key(block))
+        if row is None:
+            return [], 0
+        return [from_record(record) for record in row.value], row.version
+
     def _commit(self, operation_id: str, topic: str, subject: str, at: datetime,
-                action: Callable[[], T], evidence: Mapping[str, Any] | None = None) -> OperationReceipt:
-        previous = self._receipts.get(operation_id)
-        if previous is not None:
-            if previous.topic != topic or previous.subject != subject:
-                raise ValueError("operation id reused for a different workflow")
-            return previous
-        result = action()
-        version = self.store.write(subject, _safe(result))
-        payload = {
-            "operation_id": operation_id,
-            "status": "committed",
-            "control_path": "legacy" if topic in BROKEN_CONTROL_TOPICS else "atomic",
-            "version": version,
-            "result": _safe(result),
-            **dict(evidence or {}),
-        }
-        event = self.stream.publish(operation_id, at, topic, subject, payload)
-        audit = self.trail.append("railforge-control", topic, subject, at)
-        receipt = OperationReceipt(operation_id, topic, subject, result, event, audit.index, version)
-        self._receipts[operation_id] = receipt
-        return receipt
+                action: Callable[[], T], evidence: Mapping[str, Any] | None = None,
+                *, key: str | None = None, expected_version: int | None = None) -> OperationReceipt:
+        key = subject if key is None else key
+        with self._plane_lock:
+            previous = self._receipts.get(operation_id)
+            if previous is not None:
+                # Event idempotency: a replay of a committed operation returns
+                # the original receipt and never touches state, stream or audit.
+                if previous.topic != topic or previous.subject != subject:
+                    raise ValueError("operation id reused for a different workflow")
+                return previous
+
+            # 1. Domain decision. A rejection raises before any side effect, so
+            # denied reservations are neither persisted nor broadcast.
+            result = action()
+
+            # 2. Versioned state (compare-and-swap when the caller holds a
+            # snapshot version; raises VersionConflict with no state change).
+            previous_row = self.store.read(key)
+            version = self.store.write(key, _safe(result), expected_version)
+
+            # 3. Hash-chained event publication.
+            payload = {
+                "operation_id": operation_id,
+                "status": "committed",
+                "control_path": "atomic",
+                "version": version,
+                "result": _safe(result),
+                **dict(evidence or {}),
+            }
+            try:
+                event = self.stream.publish(operation_id, at, topic, subject, payload)
+            except BaseException:
+                self.store.restore(key, previous_row)
+                raise
+
+            # 4. Audit chain append.
+            try:
+                audit = self.trail.append("railforge-control", topic, subject, at)
+            except BaseException:
+                self.stream.retract(event)
+                self.store.restore(key, previous_row)
+                raise
+
+            receipt = OperationReceipt(operation_id, topic, subject, result, event, audit.index, version)
+            self._receipts[operation_id] = receipt
+            return receipt
 
     def run(self, operation_id: str, topic: str, subject: str, at: datetime,
             action: Callable[[], T], evidence: Mapping[str, Any] | None = None) -> OperationReceipt:
         return self._commit(operation_id, topic, subject, at, action, evidence)
 
-    def reserve_block(self, operation_id, candidate, existing, clearance, at):
-        return self._commit(operation_id, "dispatch.block.reserved", candidate.train, at,
-                            lambda: reserve(candidate, existing, clearance))
+    def block_board(self, block: str):
+        """Committed occupancies for a block and the board's CAS version."""
+        with self._plane_lock:
+            return self._block_board(block)
+
+    def reserve_block(self, operation_id, candidate, existing, clearance, at,
+                      expected_version: int | None = None):
+        """Atomically reserve a block occupancy.
+
+        The decision is evaluated against the authoritative per-block board in
+        the versioned store (plus the caller-supplied baseline), with the
+        clearance protection window enforced around every other train. When
+        ``expected_version`` is given it must match the current board version
+        or a :class:`VersionConflict` is raised before any side effect. A
+        rejected reservation leaves no state, no event and no audit record; a
+        replayed operation id returns the original receipt.
+        """
+        block = candidate.block
+
+        def action():
+            candidate_utc = normalized(candidate)
+            board, _ = self._block_board(candidate_utc.block)
+            baseline = list(board)
+            for row in existing or []:
+                row_utc = normalized(row)
+                if row_utc not in baseline:
+                    baseline.append(row_utc)
+            hits = block_conflicts(candidate_utc, baseline, clearance)
+            if hits:
+                raise ValueError("block conflict: " + ",".join(hits))
+            merged = board if candidate_utc in board else board + [candidate_utc]
+            return sorted(merged, key=lambda r: (r.block, r.enter, r.train))
+
+        evidence = {
+            "block": block,
+            "clearance_seconds": clearance.total_seconds(),
+        }
+        return self._commit(operation_id, BLOCK_TOPIC, candidate.train, at, action, evidence,
+                            key=self._block_key(block), expected_version=expected_version)
 
     def validate_consist(self, operation_id, rows, subject, at):
         return self._commit(operation_id, "consist.validated", subject, at, lambda: validate(rows))
@@ -187,6 +270,3 @@ class RailForgeWorkflowControl:
     def fuse_eta(self, operation_id, rows, max_lateness, subject, at):
         return self._commit(operation_id, "eta.fused", subject, at,
                             lambda: fused_delay(rows, max_lateness))
-
-
-BROKEN_CONTROL_TOPICS.add('dispatch.block.reserved')

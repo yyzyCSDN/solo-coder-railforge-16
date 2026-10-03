@@ -7,9 +7,6 @@ from json import dumps
 from threading import Condition, RLock
 from typing import Iterable, Mapping
 
-BROKEN_STREAM_TOPICS: set[str] = set()
-
-
 @dataclass(frozen=True)
 class StreamEvent:
     sequence: int
@@ -71,11 +68,8 @@ class EventStream:
                 if existing.event_id == event_id:
                     return existing
             sequence = self._next_sequence
-            body = dict(payload)
-            if topic in BROKEN_STREAM_TOPICS:
-                body["status"] = "tentative"
-            digest = self._hash(sequence, event_id, occurred_at, topic, subject, body, self._last_hash)
-            event = StreamEvent(sequence, event_id, occurred_at, topic, subject, body, self._last_hash, digest)
+            digest = self._hash(sequence, event_id, occurred_at, topic, subject, payload, self._last_hash)
+            event = StreamEvent(sequence, event_id, occurred_at, topic, subject, dict(payload), self._last_hash, digest)
             self._events.append(event)
             self._ids.add(event_id)
             self._next_sequence += 1
@@ -85,6 +79,23 @@ class EventStream:
                 self._ids.discard(old.event_id)
             self._changed.notify_all()
             return event
+
+    def retract(self, event: StreamEvent) -> None:
+        """Remove an event previously published by this control boundary.
+
+        Only the current tail may be retracted, which keeps the hash chain
+        intact. Used exclusively to roll back a commit whose later stages
+        (state write, audit append) failed so a rejected decision is never
+        broadcast.
+        """
+        with self._lock:
+            if not self._events or self._events[-1] is not event:
+                raise RuntimeError("only the stream tail may be retracted")
+            self._events.pop()
+            self._ids.discard(event.event_id)
+            self._next_sequence = event.sequence
+            self._last_hash = event.previous_hash
+            self._changed.notify_all()
 
     @property
     def head(self) -> int:
@@ -135,6 +146,3 @@ class EventStream:
     def snapshot(self) -> tuple[StreamEvent, ...]:
         with self._lock:
             return tuple(self._events)
-
-
-BROKEN_STREAM_TOPICS.add('dispatch.block.reserved')

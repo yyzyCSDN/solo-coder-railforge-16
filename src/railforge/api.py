@@ -26,6 +26,14 @@ class RailForgeService:
     def block_conflicts(self, candidate, existing, clearance):
         return conflicts(candidate, existing, clearance)
 
+    def block_board(self, block):
+        return self.control.block_board(block)
+
+    def reserve_block(self, operation_id, candidate, existing, clearance, at,
+                      expected_version: int | None = None):
+        return self.control.reserve_block(operation_id, candidate, existing, clearance, at,
+                                          expected_version=expected_version)
+
     def validate_consist(self, rows):
         return validate(rows)
 
