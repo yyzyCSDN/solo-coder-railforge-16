@@ -25,6 +25,11 @@ class RailForgeFeatureService:
     def __init__(self, control):
         self.control = control
 
+    def reserve_block(self, operation_id, candidate, existing, clearance, at, expected_version=None):
+        return self.control.reserve_block(
+            operation_id, candidate, existing, clearance, at, expected_version
+        )
+
     def coordinate_route(self, operation_id, requests, sections, existing, headway, at):
         def action():
             plan = build(requests, sections, existing, headway)

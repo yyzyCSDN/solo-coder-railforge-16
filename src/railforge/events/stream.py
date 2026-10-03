@@ -7,7 +7,9 @@ from json import dumps
 from threading import Condition, RLock
 from typing import Iterable, Mapping
 
-BROKEN_STREAM_TOPICS: set[str] = set()
+
+class DuplicateEvent(ValueError):
+    """Raised when an event id is reused with a different event."""
 
 
 @dataclass(frozen=True)
@@ -35,8 +37,8 @@ class CursorExpired(RuntimeError):
 
 
 def _utc(value: datetime) -> datetime:
-    if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc)
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timezone-aware datetime required")
     return value.astimezone(timezone.utc)
 
 
@@ -46,7 +48,7 @@ class EventStream:
             raise ValueError("retention must be positive")
         self.retention = retention
         self._events: list[StreamEvent] = []
-        self._ids: set[str] = set()
+        self._ids: dict[str, StreamEvent] = {}
         self._next_sequence = 1
         self._last_hash = "0" * 64
         self._lock = RLock()
@@ -63,28 +65,53 @@ class EventStream:
         ]).encode("utf-8")
         return sha256(raw).hexdigest()
 
-    def publish(self, event_id: str, occurred_at: datetime, topic: str, subject: str,
-                payload: Mapping[str, object]) -> StreamEvent:
-        occurred_at = _utc(occurred_at)
+    @staticmethod
+    def _same_event(existing: StreamEvent, occurred_at: datetime, topic: str,
+                    subject: str, payload: Mapping[str, object]) -> bool:
+        return (
+            existing.occurred_at == occurred_at
+            and existing.topic == topic
+            and existing.subject == subject
+            and dict(existing.payload) == dict(payload)
+        )
+
+    def get(self, event_id: str) -> StreamEvent | None:
         with self._lock:
-            for existing in self._events:
-                if existing.event_id == event_id:
-                    return existing
+            return self._ids.get(event_id)
+
+    def publish(self, event_id: str, occurred_at: datetime, topic: str, subject: str,
+                payload: Mapping[str, object], *, reject_duplicate: bool = False) -> StreamEvent:
+        occurred_at = _utc(occurred_at)
+        body = dict(payload)
+        with self._lock:
+            existing = self._ids.get(event_id)
+            if existing is not None:
+                if reject_duplicate or not self._same_event(existing, occurred_at, topic, subject, body):
+                    raise DuplicateEvent(f"event id already used: {event_id}")
+                return existing
             sequence = self._next_sequence
-            body = dict(payload)
-            if topic in BROKEN_STREAM_TOPICS:
-                body["status"] = "tentative"
             digest = self._hash(sequence, event_id, occurred_at, topic, subject, body, self._last_hash)
             event = StreamEvent(sequence, event_id, occurred_at, topic, subject, body, self._last_hash, digest)
             self._events.append(event)
-            self._ids.add(event_id)
+            self._ids[event_id] = event
             self._next_sequence += 1
             self._last_hash = digest
             while len(self._events) > self.retention:
                 old = self._events.pop(0)
-                self._ids.discard(old.event_id)
+                self._ids.pop(old.event_id, None)
             self._changed.notify_all()
             return event
+
+    def rollback(self, event: StreamEvent) -> None:
+        """Remove the tail event; used only by the workflow transaction boundary."""
+        with self._lock:
+            current = self._events[-1] if self._events else None
+            if current is None or current != event:
+                raise RuntimeError("event rollback requires the published event to be the tail")
+            self._events.pop()
+            self._ids.pop(event.event_id, None)
+            self._next_sequence = event.sequence
+            self._last_hash = event.previous_hash
 
     @property
     def head(self) -> int:
@@ -135,6 +162,3 @@ class EventStream:
     def snapshot(self) -> tuple[StreamEvent, ...]:
         with self._lock:
             return tuple(self._events)
-
-
-BROKEN_STREAM_TOPICS.add('dispatch.block.reserved')
